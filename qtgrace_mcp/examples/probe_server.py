@@ -1,21 +1,43 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""qtgrace MCP 可行性验证 v4 — 严格按官方 qtclient 协议。
+"""qtgrace MCP 可行性验证 — 严格按官方 qtclient 协议。
 
 每个批次: 新建连接 -> initComm 握手 -> 一次性发送完整数据流
 数据流: [PLOT_INFO '@FLUSH\\n'][PLOT_INFO '@ g0 on\\n']
         [WRITE_DATAVEC len x[] y[]][WRITE_DATAVEC_FINISHED][REDRAW][END_COMM]
+
+自动探测 qtgrace 路径 (QTGRACE_PATH 环境变量 > 常见位置)。
 """
+import os
 import socket
 import struct
 import subprocess
+import sys
 import time
-import os
 
-QTGRACE = r'D:\qtgrace_v026_Win7\bin\qtgrace.exe'
+# 自动探测 qtgrace 路径
+def _find_qtgrace() -> str:
+    env = os.environ.get("QTGRACE_PATH")
+    if env and os.path.exists(env):
+        return env
+    candidates = [
+        r"D:\qtgrace_v026_Win7\bin\qtgrace.exe",
+        r"C:\qtgrace\bin\qtgrace.exe",
+        r"C:\Program Files\qtgrace\bin\qtgrace.exe",
+        "/usr/local/bin/qtgrace",
+        "/usr/bin/qtgrace",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    print("错误: 未找到 qtgrace 可执行文件, 请设置 QTGRACE_PATH 环境变量", file=sys.stderr)
+    sys.exit(1)
+
+
+QTGRACE = _find_qtgrace()
 PORT_WRITE = 25031  # Server1 -> qtgrace writeServer (client 收响应)
 PORT_READ = 25032   # Server2 -> qtgrace readServer (client 发命令)
-WORKDIR = os.path.join(os.environ['TEMP'], 'qtgrace_mcp_probe4')
+WORKDIR = os.path.join(os.environ.get("TEMP", "/tmp"), "qtgrace_mcp_probe")
 os.makedirs(WORKDIR, exist_ok=True)
 
 PLOT_INFO = 1
@@ -30,10 +52,11 @@ KILL_CHILD = 42
 initComm, endComm, readDataComm = 0, 1, 2
 
 env = dict(os.environ)
-env['QTGRACEDEBUG'] = '1'
+env["QTGRACEDEBUG"] = "1"
 
+print(f"使用 qtgrace: {QTGRACE}")
 proc = subprocess.Popen(
-    [QTGRACE, '-ServerMode', str(PORT_WRITE), str(PORT_READ)],
+    [QTGRACE, "-ServerMode", str(PORT_WRITE), str(PORT_READ)],
     cwd=WORKDIR, env=env,
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
 )
@@ -42,46 +65,48 @@ time.sleep(3.0)
 
 def new_session():
     """建新连接并握手，返回 (sock_read_cmd, sock_write_resp)。"""
-    sr = socket.create_connection(('127.0.0.1', PORT_READ), timeout=5)
-    sw = socket.create_connection(('127.0.0.1', PORT_WRITE), timeout=5)
-    sr.settimeout(8); sw.settimeout(8)
-    sr.sendall(struct.pack('i', initComm))
-    resp = struct.unpack('i', sw.recv(4))[0]
-    assert resp == initComm, f'握手失败: {resp}'
+    sr = socket.create_connection(("127.0.0.1", PORT_READ), timeout=5)
+    sw = socket.create_connection(("127.0.0.1", PORT_WRITE), timeout=5)
+    sr.settimeout(8)
+    sw.settimeout(8)
+    sr.sendall(struct.pack("i", initComm))
+    resp = struct.unpack("i", sw.recv(4))[0]
+    assert resp == initComm, f"握手失败: {resp}"
     return sr, sw
 
 
 def send_stream(sr, sw, payload: bytes):
     """发送 readDataComm + 数据流，收 endComm，关闭连接。"""
-    sr.sendall(struct.pack('i', readDataComm))
-    sr.sendall(struct.pack('i', len(payload)))
+    sr.sendall(struct.pack("i", readDataComm))
+    sr.sendall(struct.pack("i", len(payload)))
     sr.sendall(payload)
-    resp = struct.unpack('i', sw.recv(4))[0]
-    sr.close(); sw.close()
+    resp = struct.unpack("i", sw.recv(4))[0]
+    sr.close()
+    sw.close()
     return resp
 
 
 def plot_info(s):
-    b = s.encode('latin-1')
-    return struct.pack('i', PLOT_INFO) + struct.pack('i', len(b)) + b
+    b = s.encode("latin-1")
+    return struct.pack("i", PLOT_INFO) + struct.pack("i", len(b)) + b
 
 
 def datavec(xs, ys):
     n = len(xs)
-    return (struct.pack('i', WRITE_DATAVEC) + struct.pack('i', n)
-            + struct.pack('d' * n, *xs) + struct.pack('d' * n, *ys))
+    return (struct.pack("i", WRITE_DATAVEC) + struct.pack("i", n)
+            + struct.pack("d" * n, *xs) + struct.pack("d" * n, *ys))
 
 
 def cmd(c):
-    return struct.pack('i', c)
+    return struct.pack("i", c)
 
 
-print('[1] 批次1: 画图数据 (cleanPlot + datavec + finish + redraw + end)')
+print("[1] 批次1: 画图数据 (cleanPlot + datavec + finish + redraw + end)")
 xs = [i * 0.5 for i in range(10)]
 ys = [i * i for i in range(10)]
-stream = b''.join([
-    plot_info('@FLUSH\n'),
-    plot_info('@ g0 on\n'),
+stream = b"".join([
+    plot_info("@FLUSH\n"),
+    plot_info("@ g0 on\n"),
     datavec(xs, ys),
     cmd(WRITE_DATAVEC_FINISHED),
     cmd(REDRAW),
@@ -89,43 +114,40 @@ stream = b''.join([
 ])
 sr, sw = new_session()
 r = send_stream(sr, sw, stream)
-print(f'    ✅ 响应 {r} (期望 endComm=1)')
+print(f"    [OK] 响应 {r} (期望 endComm=1)")
 
-print('[2] 批次2: 设置导出文件名 (相对名, cwd 已切到 WORKDIR)')
-outbase = 'plot_out'  # 相对名 -> 写到 WORKDIR
-fb = outbase.encode('latin-1')
-stream = struct.pack('i', PS_FILENAME) + struct.pack('i', len(fb)) + fb
+print("[2] 批次2: 设置导出文件名 (相对名, cwd 已切到 WORKDIR)")
+outbase = "plot_out"  # 相对名 -> 写到 WORKDIR
+fb = outbase.encode("latin-1")
+stream = struct.pack("i", PS_FILENAME) + struct.pack("i", len(fb)) + fb
 sr, sw = new_session()
 r = send_stream(sr, sw, stream)
-print(f'    ✅ 响应 {r}')
+print(f"    [OK] 响应 {r}")
 
-print('[3] 批次3: REDRAW_AND_WRITEPS (导出)')
+print("[3] 批次3: REDRAW_AND_WRITEPS (导出)")
 sr, sw = new_session()
 r = send_stream(sr, sw, cmd(REDRAW_AND_WRITEPS))
-print(f'    ✅ 响应 {r}')
+print(f"    [OK] 响应 {r}")
 
 time.sleep(4)
-print('\n[4] 检查输出文件:')
+print("\n[4] 检查输出文件:")
 found = False
 for f in sorted(os.listdir(WORKDIR)):
     p = os.path.join(WORKDIR, f)
-    if os.path.isfile(p) and f != 'QTGRACEDEBUG.txt':
+    if os.path.isfile(p) and f != "QTGRACEDEBUG.txt":
         found = True
-        print(f'    📄 {f}  ({os.path.getsize(p)} bytes)')
+        print(f"    [FILE] {f}  ({os.path.getsize(p)} bytes)")
 if not found:
-    print('    ❌ 无输出文件')
-    import glob
-    for g in glob.glob(os.path.join(WORKDIR, 'plot_out*')) + glob.glob(os.path.join(WORKDIR, '*.png')) + glob.glob(os.path.join(WORKDIR, '*.ps')):
-        print(f'    glob: {g} ({os.path.getsize(g)} bytes)')
+    print("    [WARN] 无输出文件")
 
-print('\n[5] KILL_CHILD')
+print("\n[5] KILL_CHILD")
 try:
     sr, sw = new_session()
     send_stream(sr, sw, cmd(KILL_CHILD))
 except Exception as e:
-    print(f'    ({e})')
+    print(f"    ({e})")
 try:
     proc.wait(timeout=5)
 except Exception:
     proc.kill()
-print('\ndone')
+print("\ndone")

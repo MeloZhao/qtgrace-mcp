@@ -6,6 +6,11 @@ build/
 .venv/
 venv/
 .env
+.pytest_cache/
 *.png
+*.eps
+*.svg
+*.jpg
+*.bmp
 *.agr
 !qtgrace_mcp/**/*.py
