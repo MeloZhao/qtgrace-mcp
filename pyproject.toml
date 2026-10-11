@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qtgrace-mcp"
-version = "0.2.0"
-description = "MCP server for qtgrace (Grace/xmgrace Qt port) scientific plotting"
+version = "0.4.0"
+description = "MCP server for qtgrace (Grace/xmgrace Qt port) — TCP control of the live GUI, plus a dependency-free batch plotting engine"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -25,6 +25,8 @@ classifiers = [
     "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Visualization",
 ]
+# Only the TCP half needs these; the batch engine (batch.py, agr.py, catalog.py,
+# printer.py) and the CLI are dependency-free.
 dependencies = [
     "mcp>=1.0",
     "Pillow>=9.0",
@@ -39,10 +41,11 @@ dev = [
 
 [project.scripts]
 qtgrace-mcp = "qtgrace_mcp.server:main"
+qtgrace-plot = "qtgrace_mcp.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/your-org/qtgrace-mcp"
-Issues = "https://github.com/your-org/qtgrace-mcp/issues"
+Homepage = "https://github.com/MeloZhao/qtgrace-mcp"
+Issues = "https://github.com/MeloZhao/qtgrace-mcp/issues"
 
 [tool.setuptools]
 packages = ["qtgrace_mcp"]

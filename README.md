@@ -3,10 +3,16 @@
 MCP (Model Context Protocol) server for **qtgrace** — the Qt-based scientific plotting tool
 (a modern port of Grace/xmgrace, commonly used for GROMACS MD analysis plots).
 
-Control qtgrace programmatically over its built-in TCP ServerMode protocol: plot data,
-style axes/legends, export images (PNG/EPS/SVG/JPEG/BMP), and save `.agr` project files.
+**两条互补的路线：**
 
-> **v0.2.0** — 已升级至 MCP SDK 2.0，修复多项 bug，添加线程安全与日志系统。
+1. **TCP ServerMode** —— 控制运行中的 qtgrace GUI：实时画图、改样式、导出图像。
+2. **批处理引擎** —— 由结构化数据从零生成 `.agr` 再 `-hardcopy` 渲染，
+   **不需要 GUI 进程**，**零依赖**，能表达 TCP 通道覆盖不到的高级图型。
+
+两条路共用同一份 `.agr` 生成器、打印机保护与位图降级，所以出图结果一致。
+
+> **v0.4.0** — 合并批处理引擎：17 个 MCP 工具、能力目录、打印机根因修复、位图自动降级。
+> 41 个自带示例在 SVG 与 PNG 下**全部可出图**。
 
 ## Features
 
@@ -99,6 +105,10 @@ Or use the direct script path:
 | `list_examples` | List `.agr` examples available in the qtgrace examples directory |
 | `render_example` | Render one example `.agr` to an image (returns status + file size) |
 | `render_all_examples` | Batch-render every example and build an HTML gallery |
+| **`qtgrace_reference`** | **画图前先读。** 返回完整能力目录：图类型 / 19 种数据集 / 符号 / 线型 / 刻度格式 / 调色板 / 字体 / 输出设备 / 进阶特性 / 静默陷阱 / 现成配方 |
+| **`make_plot`** | **无头出图主力。** 由结构化数据从零生成 `.agr` 并渲染，不经 TCP，覆盖高级图型 |
+| **`describe_agr`** | 解析检查一份 `.agr`：语句数、图/数据集、数据行、已知会静默失效的写法 |
+| **`qtgrace_capabilities`** | 环境体检：路径、能否出图、**打印机风险**、输出设备 |
 
 ### Quick example
 
@@ -148,6 +158,71 @@ qtgrace_exec('@ with string\n@ string on\n@ string def "peak"')
 real time. See the **Known limitations** below for what can be *exported*
 headlessly.
 
+## Batch plotting engine (no GUI, no TCP)
+
+`make_plot` 与上面的 TCP 工具**互补**：TCP 驱动运行中的 GUI，这条路直接生成 `.agr`
+再调 `-hardcopy` 渲染，**不需要 GUI 进程**，而且能表达 `plot_data` 覆盖不到的东西。
+
+**它是零依赖的** —— `agr.py` / `catalog.py` / `batch.py` / `printer.py` 只用标准库。
+（只有 TCP 那半需要 `mcp` 与 `Pillow`。）
+
+### 能力目录：让 AI 一次看懂能画什么
+
+```python
+qtgrace_reference(section="overview")      # 三步工作流 + 「要画什么→用哪个图型」对照表
+qtgrace_reference(section="graph_types")   # XY / CHART / POLAR / POLARV2 / PIE
+qtgrace_reference(section="set_types")     # 19 种数据集类型及列顺序
+qtgrace_reference(section="advanced")      # 填充/数值标签/零轴/标注/时间戳/frame…
+qtgrace_reference(section="silent_traps")  # 写错不报错、只是不生效的坑
+```
+
+所有枚举都**从 qtgrace 源码与 examples 逆向提取**，不是猜的。
+
+### 从零生成并出图
+
+```python
+make_plot(spec_json=json.dumps({
+    "output_path": "D:/figs/a.png",
+    "graphs": [{
+        "graph_type": "XY",
+        "title": "阻尼振荡", "world": [0, -1.2, 6.3, 1.2],
+        "xaxis": {"label": "x (rad)", "tickMajor": 1, "zero": True},
+        "yaxis": {"label": "y", "tickMajor": 0.5},
+        "sets": [{"type": "xy", "lineType": 1, "lineColor": 2,
+                  "fill": {"type": 2, "color": 7},
+                  "data": [[0,0], [1.57,1], [3.14,0], [4.71,-1], [6.28,0]]}],
+    }],
+}), save_agr=True)
+```
+
+```
+出图成功: D:\figs\a.png  (PNG, 792x612)
+工程文件: D:\figs\a.agr  (可在 qtgrace GUI 里打开微调)
+```
+
+`save_agr=True` 会留下 `.agr` 工程文件 —— 这是 **「AI 出图 + 人工调位置」** 的工作流：
+AI 负责数据、坐标轴、样式，你在 qtgrace GUI 里拖标签、调位置，然后 File/Save。
+
+### 命令行（不经过 MCP）
+
+```bash
+qtgrace-plot spec.json -o fig.png            # 从 JSON 规格出图
+qtgrace-plot --agr old.agr -o fig.eps        # 渲染已有 .agr
+qtgrace-plot --save-agr spec.json -o fig.png # 同时留下 .agr
+qtgrace-plot --doctor                        # 探测能否出图（含打印机体检）
+qtgrace-plot --printers                      # 列出打印机，标出网络设备
+qtgrace-plot --reference advanced            # 查能力目录
+```
+
+### 实测覆盖
+
+| 项目 | 结果 |
+|---|---|
+| qtgrace 自带 41 个示例 × SVG | **41/41** |
+| qtgrace 自带 41 个示例 × PNG | **41/41**（7 个走位图降级） |
+| `.agr` 指令覆盖率 | 41/46（89%，其余为轴/刻度子属性，本就能生成） |
+| 单元测试 | 80 个通过 |
+
 ## Examples
 
 - `examples/probe_server.py` — low-level TCP protocol probe (protocol validation)
@@ -179,30 +254,41 @@ render_example(name="bar")         # renders bar.agr -> .../rendered/bar.png
 render_all_examples(format="png")  # renders every .agr + writes gallery/index.html
 ```
 
-> **Known limitations (qtgrace v026, learned from the docs + examples):**
+> **已解决的限制（v0.4.0 更正）：**
 >
-> 1. **Batch rendering (`-hardcopy`) is reliable only for the *original* `.agr`
->    files shipped with qtgrace.** Programmatically generated or modified `.agr`
->    (any structural change — graph type, added set, log axis) tends to make
->    qtgrace *hang* in `-hardcopy` mode rather than error out. The example
->    replication therefore renders the untouched example `.agr` files directly;
->    it does **not** generate new `.agr` from scratch for the advanced types.
-> 2. **`-hardcopy` segfaults on 7 plot types** — `charts`, `logit`, `pie`,
->    `terr`, `tstack`, `txyr`, `xyz`. These are reported as `failed` and skipped.
-> 3. **Four examples reference external `.dat` files not shipped in this Windows
->    build** — `chartebar`, `motif`, `symslines`, `xysize`. Detected up-front and
->    skipped with a clear message.
-> 4. **TCP ServerMode is a *narrow* channel.** Sending Grace commands via
->    `qtgrace_exec` is reliable (GUI updates live), but *headless export* of the
->    advanced graph types (Chart/stacked/Polar/Pie) via `export_image` **hangs**.
->    Only `XY` and basic `bar` plots export headlessly through TCP. For advanced
->    types, view them in the GUI instead of exporting. (This is a qtgrace v026
->    headless-render limitation, not an MCP bug.)
+> 下面三条曾记录为 qtgrace v026 的固有限制。经过实测，它们**都不是 qtgrace 的问题**，
+> 现在全部已修复 —— 41 个自带示例在 SVG 和 PNG 下**都能出图**。
 >
-> Net: the robust path for browsing every example is `render_all_examples`
-> (→ `gallery/index.html`); the robust path for ad-hoc plotting is `plot_data`
-> / `plot_and_export` for XY & simple bar, plus `qtgrace_exec` for interactively
-> driving advanced types in the live GUI.
+> 1. ~~**程序生成的 `.agr` 会让 `-hardcopy` 挂起**~~ → **根因是默认打印机**。
+>    qtgrace 的 `-hardcopy` 会构造 `QPrinter`，也就是向 Windows 索取默认打印机；
+>    若默认打印机是**不可达的网络打印机**（打印机关机 / 笔记本离开办公室 / VPN 断），
+>    Windows 会弹出模态框「正在等待打印机连接…」并**永久阻塞**。
+>    实测交替切换默认打印机：HP 网络打印机 → 挂起；`Microsoft Print to PDF` → 0.6 s 出图；
+>    切回 HP → 又挂起。**与 `.agr` 是生成的还是原装的无关。**
+>    → 已由 `printer_guard` 修复（渲染期间临时切到本地打印机，结束后还原）。
+> 2. ~~**`-hardcopy` 在 7 类图上段错误**~~ → **只有 PNG/JPEG 会**，因为它们是唯一走
+>    **Qt 自带光栅引擎**的设备；SVG/EPS/PS/MIF/PNM 走 Grace 原生驱动，从不崩。
+>    → 已由**位图降级**修复：崩溃时改用 PNM 渲染再转换。PNG 用纯标准库编码
+>    （zlib + struct，不需要 Pillow），JPEG 用 Pillow。
+>    `charts` / `logit` / `pie` / `terr` / `tstack` / `txyr` / `xyz` 现在都能出图。
+> 3. ~~**4 个示例缺外部 `.dat` 文件**~~ → `chartebar` / `motif` / `symslines` / `xysize`
+>    实测**都能正常渲染**（SVG 与 PNG 均通过）。
+>
+> 仍然成立的两条：
+> 4. **TCP ServerMode 是窄通道**：`qtgrace_exec` 发命令可靠（GUI 实时更新），但
+>    经 `export_image` **无头导出**高级图型（Chart/stacked/Polar/Pie）会挂起。
+>    → 需要无头出图时请改用 `make_plot`（走文件 + `-hardcopy`，不经 TCP）。
+> 5. **PNG 光栅尺寸固定 792×612 px**：`@page size` 与 `-fixed w h` 都不生效。
+>    要高清请用矢量格式（SVG/EPS/PS）。
+
+> **两条路线怎么选**
+>
+> | 需求 | 用哪个 |
+> |---|---|
+> | 浏览/复刻全部示例 | `render_all_examples` → `gallery/index.html` |
+> | 无头出图、高级图型、批量 | **`make_plot`**（文件 + `-hardcopy`，不经 TCP） |
+> | 交互式调图、实时看 GUI | `start_qtgrace` + `plot_data` + `qtgrace_exec` |
+> | 想手工微调排版 | `make_plot(save_agr=true)` 留下 `.agr`，在 GUI 里打开 |
 
 ## Testing
 
@@ -235,6 +321,37 @@ This server wraps that protocol into ergonomic MCP tools.
 Each operation creates a fresh connection; no persistent session state.
 
 ## Changelog
+
+### v0.4.0 (2026-10-11)
+
+**合并批处理引擎 —— 修掉此前记录的三条「已知限制」**
+
+- 新增 `qtgrace_mcp/` 下的零依赖模块：`agr.py`（.agr 生成器）、`catalog.py`（能力目录）、
+  `batch.py`（批处理渲染）、`printer.py`（打印机保护）、`cli.py`（命令行）
+- 新增 4 个 MCP 工具（共 17 个）：`qtgrace_reference`、`make_plot`、`describe_agr`、
+  `qtgrace_capabilities`
+- 新增 `qtgrace-plot` 命令行入口（`--agr` / `--save-agr` / `--doctor` / `--printers` /
+  `--reference`）
+- **修复「程序生成的 .agr 会让 -hardcopy 挂起」** —— 根因是**默认打印机**：
+  `-hardcopy` 会构造 `QPrinter` 并向 Windows 索取默认打印机，网络打印机不可达时
+  Windows 弹模态框「正在等待打印机连接…」并永久阻塞。实测交替切换：HP 网络打印机 →
+  挂起；`Microsoft Print to PDF` → 0.6 s 出图。与 `.agr` 是否生成无关。
+  修复方式：`printer_guard` 渲染期间临时切到本地打印机，结束后还原
+- **修复「7 类图段错误」** —— 只有 PNG/JPEG 会，因为它们是唯一走 Qt 自带光栅引擎的设备。
+  修复方式：崩溃时改用 PNM（Grace 原生驱动）渲染再转换；PNG 用纯标准库编码
+  （zlib + struct，无需 Pillow）
+- **更正「4 个示例缺外部数据」** —— `chartebar` / `motif` / `symslines` / `xysize`
+  实测都能正常渲染
+- `.agr` 生成器覆盖 41/46 条指令（89%），含填充、数值标签、零轴、对侧轴、
+  文字/线/箭头/椭圆/矩形标注、时间戳、frame、autoscale、worldStack、znorm、defaults
+- 记录两个**静默陷阱**（写错不报错、只是不生效）：
+  ① `@with line` / `@with box` / `@with ellipse` 必须由顶格的 `@line def` 等提交；
+  ② 零轴开关是 `xaxis type zero true`，不是 `zeroxaxis tick on`
+- 新增 80 个单元测试（合计 100+）；实测 41 个示例 × SVG/PNG 全部通过
+- **修复 `QtGraceBatchRenderer.render()`** —— 它原先用 `build_batch_agr()` 生成
+  **Grace 命令脚本**（`READ XY "…"` 那一串），却当 `.agr` 工程文件传给 qtgrace，
+  于是静默不出图（`test_batch_renderer` 一直失败）。现在改走 `agr.build_agr()`
+  生成真正的 `.agr`（数据内嵌），测试通过
 
 ### v0.3.0 (2026-08-23)
 

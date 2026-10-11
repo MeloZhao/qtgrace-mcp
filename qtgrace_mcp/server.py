@@ -43,6 +43,14 @@ try:
 except ImportError:
     HAVE_MCP = False
 
+# Batch-engine helpers from this same package.
+#   printer_guard  — an unreachable network default printer makes qtgrace block
+#                    forever on a modal dialog; the guard swaps in a local one.
+#   convert_pnm_bitmap — PNG/JPEG go through Qt's raster engine and segfault on
+#                    some projects; PNM uses Grace's own driver and never does.
+from .printer import printer_guard  # noqa: E402
+from .batch import _convert_bitmap as convert_pnm_bitmap  # noqa: E402
+
 # ---------------- 协议常量 ----------------
 PLOT_INFO = 1
 WRITE_DATAVEC = 2
@@ -824,30 +832,58 @@ def _hardcopy_render(qtgrace_path: str, agr_path: str, out_path: str,
     run_cwd = cwd or os.path.dirname(agr_path) or "."
     os.makedirs(run_cwd, exist_ok=True)
     stem = os.path.splitext(os.path.basename(agr_path))[0]
-    produced = os.path.join(run_cwd, f"{stem}.{ext}")
-    # 清理可能残留的同名文件, 避免误判
-    if os.path.exists(produced):
-        try:
-            os.remove(produced)
-        except OSError:
-            pass
-    proc = subprocess.Popen(
-        [qtgrace_path, "-hardcopy", "-hdevice", dev,
-         "-printfile", "x", agr_path, "-nosigcatch", "-noask"],
-        cwd=run_cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-    )
-    try:
-        rc = proc.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        try:
-            proc.wait(timeout=5)
-        except Exception:
-            pass
-        raise QtGraceError(
-            f"渲染超时(>{timeout}s): {os.path.basename(agr_path)}")
-    # 不以 returncode 判成功: segfault 可能 rc=0 但不出图
-    if not (os.path.exists(produced) and os.path.getsize(produced) > 0):
+
+    def _run_once(device: str, suffix: str) -> Optional[str]:
+        """One qtgrace run.  Returns the produced path, or None on failure."""
+        target = os.path.join(run_cwd, f"{stem}.{suffix}")
+        # 清理可能残留的同名文件, 避免误判
+        if os.path.exists(target):
+            try:
+                os.remove(target)
+            except OSError:
+                pass
+        # 打印机保护: 默认打印机若是不可达的网络打印机, qtgrace 会弹模态框
+        # 「正在等待打印机连接…」并永久阻塞。guard 在渲染期间临时切到本地设备。
+        with printer_guard():
+            proc = subprocess.Popen(
+                [qtgrace_path, "-hardcopy", "-hdevice", device,
+                 "-printfile", "x", agr_path, "-nosigcatch", "-noask"],
+                cwd=run_cwd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                raise QtGraceError(
+                    f"渲染超时(>{timeout}s): {os.path.basename(agr_path)}\n"
+                    f"最常见的原因是默认打印机不可达 —— 用 qtgrace_capabilities "
+                    f"查看 printer_risky, 或先跑 qtgrace_plot.py --printers")
+        # 不以 returncode 判成功: segfault 可能 rc=0 但不出图
+        if os.path.exists(target) and os.path.getsize(target) > 0:
+            return target
+        return None
+
+    produced = _run_once(dev, ext)
+
+    # PNG/JPEG 是唯一走 Qt 自带光栅引擎的设备, 某些工程会让 qtgrace 段错误。
+    # PNM 走 Grace 自己的驱动, 从不崩 —— 改用它渲染再转换。
+    if produced is None and dev in ("PNG", "JPEG"):
+        pnm = _run_once("PNM", "pnm")
+        if pnm:
+            out_path = os.path.abspath(out_path)
+            if os.path.dirname(out_path):
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            ok, err = convert_pnm_bitmap(pnm, out_path, dev)
+            if ok:
+                return out_path
+            raise QtGraceError(
+                f"{dev} 渲染崩溃, 且 PNM 转换失败: {err}")
+
+    if produced is None:
         raise QtGraceError(
             f"渲染未产生有效输出(可能崩溃或数据缺失): {os.path.basename(agr_path)}")
     out_path = os.path.abspath(out_path)
@@ -890,39 +926,46 @@ class QtGraceBatchRenderer:
                legends=None, fmt="png", set_type="xy", style=None,
                xmin=None, xmax=None, ymin=None, ymax=None,
                timeout: int = 90) -> str:
-        """由数据现场生成 Grace 命令脚本并 hardcopy 渲染 (无 TCP)。"""
+        """由数据现场生成 .agr 工程文件并 hardcopy 渲染 (无 TCP)。
+
+        走 agr.build_agr 生成**真正的 .agr 项目文件**(数据内嵌), 而不是旧版的
+        Grace 命令脚本 —— 后者被当作位置参数传给 qtgrace 时不会被当工程加载,
+        结果静默不出图 (旧 test_batch_renderer 失败的原因)。
+        """
+        from .agr import build_agr
+
         tag = uuid.uuid4().hex[:8]
         agr_path = os.path.join(self.workdir, f"plot_{tag}.agr")
         fmt = (fmt or "png").lstrip(".")
         ext = DEV_EXT.get(DEVICE_MAP.get(fmt, fmt), fmt)
         out = os.path.join(self.workdir,
                            f"{os.path.basename(filename or 'plot')}.{ext}")
-        # 为每个数据集生成外部数据文件 (Grace READ 命令最可靠)
-        data_files = []
+
+        # datasets 是列式: [(xs, ys), ...] 或 [(xs, ys, errs), ...]
+        sets = []
         for i, ds in enumerate(datasets):
-            dat_path = os.path.join(self.workdir, f"plot_{tag}_s{i}.dat")
-            n = len(ds[0])
-            with open(dat_path, "w", encoding="utf-8") as f:
-                for row in range(n):
-                    vals = " ".join(f"{ds[col][row]:.10g}"
-                                    for col in range(len(ds)))
-                    f.write(vals + "\n")
-            data_files.append(dat_path)
-        agr = build_batch_agr(datasets, title, xlabel, ylabel, legends,
-                              set_type, style, xmin, xmax, ymin, ymax,
-                              data_files=data_files)
+            cols = [list(c) for c in ds]
+            rows = [[cols[c][r] for c in range(len(cols))]
+                    for r in range(len(cols[0]))]
+            entry = {"type": set_type or "xy", "data": rows}
+            if legends and i < len(legends):
+                entry["legend"] = legends[i]
+            if style:
+                entry.update({k: v for k, v in style.items()
+                              if k not in ("legend", "data", "type")})
+            sets.append(entry)
+
+        graph = {"title": title, "sets": sets,
+                 "xaxis": {"label": xlabel}, "yaxis": {"label": ylabel}}
+        if None not in (xmin, ymin, xmax, ymax):
+            graph["world"] = [xmin, ymin, xmax, ymax]
+
         with open(agr_path, "w", encoding="utf-8") as f:
-            f.write(agr)
+            f.write(build_agr({"graphs": [graph]}))
         try:
             result = _hardcopy_render(self.path, agr_path, out, fmt,
                                       cwd=self.workdir, timeout=timeout)
         finally:
-            # 清理临时数据/脚本
-            for df in data_files:
-                try:
-                    os.remove(df)
-                except OSError:
-                    pass
             try:
                 os.remove(agr_path)
             except OSError:
@@ -1460,6 +1503,199 @@ if HAVE_MCP:
                 f"write_port={_controller.write_port}, "
                 f"read_port={_controller.read_port}, "
                 f"workdir={_controller.workdir})")
+
+
+    # =================================================================
+    # 批处理引擎 (batch.py) + 能力目录 (catalog.py)
+    #
+    # 与上面的 TCP 工具互补: TCP 驱动运行中的 GUI, 这里是无 GUI 的确定性出图。
+    # 两条路共用同一份 .agr 生成器与打印机保护。
+    # =================================================================
+
+    @mcp.tool()
+    def qtgrace_reference(section: str = "overview") -> str:
+        """【画图前先读】qtgrace 能力目录 —— 有哪些图能画、参数填什么。
+
+        返回机器可读的完整能力清单 (从 qtgrace 源码与 examples 逆向得出)。
+
+        section 可选:
+          overview     三步工作流 + 「你要画什么→用哪个 graph_type」对照表
+          graph_types  XY / CHART / POLAR / POLARV2 / PIE
+          set_types    全部 19 种数据集类型及列顺序 (xydy=[x,y,err] 等)
+          symbols      符号代码 0-11
+          line_types   线型代码 0-7
+          axes         刻度格式、刻度朝向、轴缩放 (normal/log/reciprocal/logit)
+          colors       调色板序号→名称→RGB
+          fonts        字体序号→PostScript 名
+          expressions  表达式内置函数
+          devices      输出格式及哪些真的可用
+          advanced     fill / baseline / dropline / avalue / 零轴 / 对侧轴 /
+                       标注 (文字/线/箭头/椭圆/矩形) / 时间戳 / frame /
+                       autoscale / worldStack / znorm / defaults
+          silent_traps 写错不报错、只是静默不生效的坑
+          recipes      可直接照搬的完整 make_plot 调用
+          limitations  本构建的硬限制
+          all          全部
+        """
+        import json
+        from . import catalog
+        return json.dumps(catalog.get_section(section), ensure_ascii=False, indent=2)
+
+    @mcp.tool()
+    def make_plot(spec_json: str, save_agr: bool = False,
+                  device: str = "PNG", timeout_ms: int = 60000) -> str:
+        """【主力工具】由结构化数据从零生成 .agr 并渲染出图。
+
+        与 plot_data 的区别: plot_data 经 TCP 驱动运行中的 GUI; make_plot 直接
+        生成 .agr 文件再调 -hardcopy 渲染, 不需要 GUI 进程, 且能表达 plot_data
+        覆盖不到的高级图形 (Chart/Polar/Pie/对数轴/填充/标注)。
+
+        spec_json: JSON 字符串, 结构如下 (详见 qtgrace_reference):
+        {
+          "output_path": "D:/figs/a.png",
+          "width_cm": 8.6, "height_cm": 6.4,
+          "description": "可选工程说明",
+          "timestamp": {"format": "run 42"},            // 可选
+          "annotations": [{"type":"text","x":0.1,"y":0.9,"text":"hi","graph":0},
+                          {"type":"arrow","x1":0,"y1":0,"x2":1,"y2":1,"graph":0}],
+          "graphs": [{
+            "graph_type": "XY",                          // XY/CHART/POLAR/POLARV2/PIE
+            "title": "标题", "world": [xmin,ymin,xmax,ymax],
+            "xaxis": {"label":"x","scale":"log","tickMajor":1,"zero":true,"alt":true},
+            "yaxis": {"label":"y","tickMajor":0.5},
+            "legend": {"pos":[0.6,0.8]},
+            "sets": [{"type":"xydy","legend":"L","lineType":1,"lineColor":2,
+                      "fill":{"type":2,"color":7},
+                      "avalue":{"type":2,"prec":2},
+                      "data":[[x,y,yerr], ...]}]
+          }]
+        }
+
+        颜色用调色板序号 (1黑 2红 3绿 4蓝 5黄 11橙), 不是十六进制。
+        建议显式给 world, 否则每次自动缩放结果可能不同。
+
+        save_agr=True 时同时写出 .agr 工程文件 (与图片同名同目录), 可在 GUI 里
+        打开手工微调 —— 这是「AI 出图 + 人工调位置」的工作流。
+
+        PNG/JPEG 若因 qtgrace 段错误失败, 会自动改用 PNM 渲染再转换, 所以位图
+        始终能出。矢量输出 (SVG/EPS/PS) 更稳, 投稿优先用它们。
+        """
+        import json as _json
+        from .agr import build_agr
+        from .batch import render as _render
+
+        try:
+            spec = _json.loads(spec_json) if isinstance(spec_json, str) else dict(spec_json)
+        except _json.JSONDecodeError as exc:
+            return f"spec_json 不是合法 JSON: {exc}"
+
+        if not spec.get("output_path"):
+            return "spec 缺少 output_path"
+        try:
+            agr = build_agr(spec)
+        except ValueError as exc:
+            return (f"参数错误: {exc}\n"
+                    f"调用 qtgrace_reference(section='graph_types'/'set_types') 查合法取值")
+
+        try:
+            r = _render(agr_text=agr,
+                        device=device or spec.get("device", "PNG"),
+                        output_path=spec["output_path"],
+                        timeout_ms=timeout_ms,
+                        save_agr=save_agr)
+        except Exception as exc:  # noqa: BLE001
+            return f"渲染失败: {exc}"
+
+        if not r.get("ok"):
+            return f"渲染失败: {r.get('error')}\n{r.get('hint','')}"
+
+        size = (f"{r.get('width')}x{r.get('height')}"
+                if r.get("width") else f"{r.get('bytes')} bytes")
+        out = [f"出图成功: {r['output_path']}  ({r['device']}, {size})"]
+        if r.get("agr_path"):
+            out.append(f"工程文件: {r['agr_path']}  (可在 qtgrace GUI 里打开微调)")
+        if r.get("bitmap_fallback"):
+            out.append(f"注意: {r['bitmap_fallback']}")
+        return "\n".join(out)
+
+    @mcp.tool()
+    def describe_agr(agr_text: str = "", agr_path: str = "") -> str:
+        """解析检查一份 .agr: 语句数、图/数据集、数据行, 以及本构建已知会拒绝的写法。
+
+        改完 .agr 想先确认没问题再渲染时用。
+        """
+        import re
+        path = agr_path
+        if not agr_text and path:
+            if not os.path.isfile(path):
+                return f"文件不存在: {path}"
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                agr_text = fh.read()
+        if not agr_text:
+            return "请提供 agr_text 或 agr_path"
+
+        lines = agr_text.splitlines()
+        graphs, sets, rows = set(), set(), 0
+        for raw in lines:
+            s = raw.strip()
+            if s.startswith("@with g"):
+                graphs.add(s.split("g", 1)[1].strip())
+            elif s.startswith("@target g") and "." in s:
+                g, st = s.split(None, 1)[1].split(".", 1)
+                graphs.add(g.lstrip("g"))
+                sets.add(f"{g}.{st}")
+            elif s and not s.startswith("#") and s != "&":
+                rows += 1
+
+        warns = []
+        inline = [ln for ln in lines if ln.strip().startswith("@") and "#" in ln]
+        if inline:
+            warns.append(f"{len(inline)} 行含行内 # 注释 —— 本构建会整行判语法错误")
+        for ln in lines:
+            m = re.match(r"@\s*with\s+(line|box|ellipse)\s*$", ln)
+            if m:
+                kw = m.group(1)
+                if not any(re.match(rf"@{kw}\s+def\s*$", x) for x in lines):
+                    warns.append(f"有 @with {kw} 块但缺少顶格的 @{kw} def —— 该标注不会画出来")
+        return "\n".join([
+            f"行数      : {len(lines)}",
+            f"语句数    : {sum(1 for ln in lines if ln.strip().startswith('@'))}",
+            f"图        : {sorted(graphs) or '(无)'}",
+            f"数据集    : {len(sets)}",
+            f"数据行    : {rows}",
+            f"有 @version: {'是' if any(ln.strip().startswith('@version') for ln in lines) else '否'}",
+        ] + (["警告:"] + [f"  - {w}" for w in warns] if warns else []))
+
+    @mcp.tool()
+    def qtgrace_capabilities() -> str:
+        """环境体检: qtgrace 路径、能否出图、打印机风险、输出设备。
+
+        画图前或排查失败时先看这个。特别是 printer_risky —— 默认打印机若是不
+        可达的网络打印机, qtgrace 的 -hardcopy 会弹模态框「正在等待打印机连接…」
+        并永久阻塞 (这是最常见的"卡住不出图"原因)。
+        """
+        import json
+        from .batch import probe, resolve_exe, resolve_home
+        from .printer import diagnose
+
+        exe = resolve_exe()
+        info = {
+            "executable": exe,
+            "executable_present": os.path.isfile(exe),
+            "grace_home": resolve_home(exe),
+        }
+        try:
+            info["printer"] = diagnose()
+            info["printer_risky"] = bool(info["printer"].get("risky"))
+        except Exception as exc:  # noqa: BLE001
+            info["printer_error"] = str(exc)
+        try:
+            h = probe()
+            info["rendering_available"] = h["ok"]
+            info["rendering_note"] = h["reason"]
+        except Exception as exc:  # noqa: BLE001
+            info["rendering_note"] = str(exc)
+        return json.dumps(info, ensure_ascii=False, indent=2)
 
 
 def main() -> None:
